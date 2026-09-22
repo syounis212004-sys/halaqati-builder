@@ -1,275 +1,205 @@
-name: Build Halaqati APK
-
+name: Halaqati - source compiler fix
 on:
   workflow_dispatch:
-
+    inputs:
+      source_repository:
+        description: 'Repository containing the fixed ZIP (owner/name); blank = this repository'
+        default: 'syounis212004-sys/halaqati-app'
+        type: string
+      source_ref:
+        description: 'Source branch, tag or commit'
+        default: 'main'
+        type: string
+      variant:
+        description: 'debug for testing; release for an update signed with your existing key'
+        default: debug
+        type: choice
+        options: [debug, release]
 permissions:
   contents: read
-
+concurrency:
+  group: halaqati-fixed-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+env:
+  ARCHIVE_SHA256: 4da3186c0528fdbe8b9bfeade149ae738e0bcdb40e9567c5c512b64204c9adee
+  PROJECT_DIR: ${{ github.workspace }}/extracted/Halaqati_Native_Kotlin_v2.45.2
+  GRADLE_VERSION: '8.13'
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
-
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
     steps:
-      - name: Checkout private Halaqati source repository
+      - name: Checkout source repository
         uses: actions/checkout@v4
         with:
-          repository: syounis212004-sys/halaqati-app
-          token: ${{ secrets.HALAQATI_REPO_TOKEN }}
-          path: private-repo
-          fetch-depth: 1
+          repository: ${{ inputs.source_repository || github.repository }}
+          ref: ${{ inputs.source_ref }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN || secrets.HALAQATI_SOURCE_TOKEN || secrets.SOURCE_PAT || secrets.GH_PAT || github.token }}
+          path: source-repo
+          persist-credentials: false
 
-      - name: Verify and extract frozen source
-        shell: bash
+      - name: Verify exact fixed archive and extract
         run: |
           set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, os, zipfile
+          from pathlib import Path
+          matches = [p for p in Path('source-repo').rglob('Halaqati_Native_Kotlin_v2_45_2_BUILD_FIX*.zip')
+                     if '.git' not in p.parts and hashlib.sha256(p.read_bytes()).hexdigest() == os.environ['ARCHIVE_SHA256']]
+          if len(matches) != 1:
+              raise SystemExit('Upload exactly one matching Halaqati_Native_Kotlin_v2_45_2_BUILD_FIX.zip to the selected source repository/ref.')
+          dest = Path('extracted').resolve()
+          dest.mkdir()
+          with zipfile.ZipFile(matches[0]) as z:
+              if z.testzip(): raise SystemExit('Corrupt source ZIP')
+              for info in z.infolist():
+                  target = (dest / info.filename).resolve()
+                  if not target.is_relative_to(dest): raise SystemExit('Unsafe archive member')
+                  if (info.external_attr >> 16) & 0o170000 == 0o120000: raise SystemExit('Symlinks are not allowed')
+              z.extractall(dest)
+          print('Verified fixed source SHA-256:', os.environ['ARCHIVE_SHA256'])
+          PY
 
-          EXPECTED_SHA256="48896929ebafe053a2b959fa86169d639e8f5e52ec5f1b5f6e8ce2e020c14c08"
-          ZIP_FILE="$(find "$GITHUB_WORKSPACE/private-repo" -maxdepth 1 -type f -name "*.zip" | head -n 1)"
-
-          if [ -z "${ZIP_FILE:-}" ]; then
-            echo "ERROR: Halaqati source ZIP was not found."
-            exit 1
-          fi
-
-          ACTUAL_SHA256="$(sha256sum "$ZIP_FILE" | awk '{print $1}')"
-          echo "Source archive SHA-256: $ACTUAL_SHA256"
-
-          if [ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]; then
-            echo "ERROR: Frozen source SHA-256 mismatch."
-            exit 1
-          fi
-
-          rm -rf "$GITHUB_WORKSPACE/extracted"
-          mkdir -p "$GITHUB_WORKSPACE/extracted"
-          unzip -q "$ZIP_FILE" -d "$GITHUB_WORKSPACE/extracted"
-
-          PROJECT_DIR="$GITHUB_WORKSPACE/extracted/Halaqati_Native_Kotlin_v2.45.2"
-
-          test -f "$PROJECT_DIR/settings.gradle.kts"
-          test -f "$PROJECT_DIR/build.gradle.kts"
-          test -f "$PROJECT_DIR/app/build.gradle.kts"
-          test -f "$PROJECT_DIR/gradle.properties"
-
-          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-
-      - name: Set up Java 17
+      - name: Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "17"
+          java-version: '17'
 
-      - name: Use preinstalled Android SDK
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
-          if [ ! -d "$SDK_ROOT" ]; then
-            echo "ERROR: Android SDK root not found: $SDK_ROOT"
-            exit 1
-          fi
-
-          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
-          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
-
-          # ubuntu-24.04 hosted runners already include Android platform 36 and
-          # build-tools 36.0.0. Only install them if the image ever changes.
-          if [ ! -d "$SDK_ROOT/platforms/android-36" ] || [ ! -d "$SDK_ROOT/build-tools/36.0.0" ]; then
-            SDKMANAGER="$(command -v sdkmanager || true)"
-            if [ -z "$SDKMANAGER" ]; then
-              SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -type f -path '*/bin/sdkmanager' 2>/dev/null | sort -V | tail -n 1 || true)"
-            fi
-            if [ -z "$SDKMANAGER" ] || [ ! -x "$SDKMANAGER" ]; then
-              echo "ERROR: sdkmanager not found and required Android packages are missing."
-              exit 1
-            fi
-            yes | "$SDKMANAGER" --licenses >/dev/null || true
-            "$SDKMANAGER" "platforms;android-36" "build-tools;36.0.0" "platform-tools"
-          fi
-
-          test -d "$SDK_ROOT/platforms/android-36"
-          test -d "$SDK_ROOT/build-tools/36.0.0"
-          echo "sdk.dir=$SDK_ROOT" > "$PROJECT_DIR/local.properties"
-
-          echo "Android SDK ready: $SDK_ROOT"
-          echo "Platform: android-36"
-          echo "Build tools: 36.0.0"
-
-      - name: Set up Gradle 8.13
+      - name: Gradle 8.13 (no compiler upgrade at build time)
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: "8.13"
+          gradle-version: ${{ env.GRADLE_VERSION }}
+          cache-disabled: true
 
-      - name: Upgrade Kotlin and migrate compiler DSL
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$PROJECT_DIR"
+      - name: Android SDK
+        uses: android-actions/setup-android@v3
+      - name: Install SDK 36
+        timeout-minutes: 8
+        run: sdkmanager 'platforms;android-36' 'build-tools;36.0.0'
 
-          python3 - <<'PY'
-          from pathlib import Path
-
-          root = Path("build.gradle.kts")
-          app = Path("app/build.gradle.kts")
-
-          root_text = root.read_text(encoding="utf-8")
-          app_text = app.read_text(encoding="utf-8")
-
-          replacements = {
-              'id("org.jetbrains.kotlin.android") version "2.2.21" apply false':
-                  'id("org.jetbrains.kotlin.android") version "2.4.20" apply false',
-              'id("org.jetbrains.kotlin.plugin.compose") version "2.2.21" apply false':
-                  'id("org.jetbrains.kotlin.plugin.compose") version "2.4.20" apply false',
-          }
-
-          for old, new in replacements.items():
-              if old not in root_text:
-                  raise SystemExit(f"ERROR: expected plugin declaration not found: {old}")
-              root_text = root_text.replace(old, new, 1)
-
-          legacy = '    kotlinOptions { jvmTarget = "17" }\n'
-          if legacy not in app_text:
-              raise SystemExit("ERROR: legacy kotlinOptions JVM target was not found")
-          app_text = app_text.replace(legacy, "", 1)
-
-          compiler_block = (
-              'kotlin {\n'
-              '    compilerOptions {\n'
-              '        jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.fromTarget("17")\n'
-              '    }\n'
-              '}\n\n'
-          )
-
-          anchor = '\ndependencies {\n'
-          if anchor not in app_text:
-              raise SystemExit("ERROR: dependencies block not found")
-          app_text = app_text.replace(anchor, '\n' + compiler_block + 'dependencies {\n', 1)
-
-          root.write_text(root_text, encoding="utf-8")
-          app.write_text(app_text, encoding="utf-8")
-          PY
-
-      - name: Restore Firebase configuration
-        shell: bash
+      - name: Restore Firebase and optional release signing
+        working-directory: ${{ env.PROJECT_DIR }}
         env:
-          FIREBASE_JSON: ${{ secrets.HALAQATI_FIREBASE_GOOGLE_SERVICES_JSON }}
           FIREBASE_JSON_B64: ${{ secrets.HALAQATI_FIREBASE_GOOGLE_SERVICES_JSON_BASE64 }}
+          FIREBASE_JSON: ${{ secrets.HALAQATI_FIREBASE_GOOGLE_SERVICES_JSON }}
+          KEYSTORE_B64: ${{ secrets.HALAQATI_KEYSTORE_BASE64 }}
+          HALAQATI_STORE_PASSWORD: ${{ secrets.HALAQATI_STORE_PASSWORD }}
+          HALAQATI_KEY_ALIAS: ${{ secrets.HALAQATI_KEY_ALIAS }}
+          HALAQATI_KEY_PASSWORD: ${{ secrets.HALAQATI_KEY_PASSWORD }}
+          EXPECTED_CERT: ${{ secrets.HALAQATI_EXPECTED_SIGNING_CERT_SHA256 }}
+          VARIANT: ${{ inputs.variant }}
         run: |
           set -euo pipefail
-          cd "$PROJECT_DIR"
-
           python3 - <<'PY'
-          import base64
-          import json
-          import os
+          import os, json, base64
           from pathlib import Path
-
-          raw = os.environ.get("FIREBASE_JSON", "").strip()
-          b64 = os.environ.get("FIREBASE_JSON_B64", "").strip()
-          target = Path("app/google-services.json")
-
-          if b64:
-              target.write_bytes(base64.b64decode(b64, validate=False))
-          elif raw:
-              target.write_text(raw, encoding="utf-8")
-          else:
-              raise SystemExit(
-                  "ERROR: Add HALAQATI_FIREBASE_GOOGLE_SERVICES_JSON "
-                  "or HALAQATI_FIREBASE_GOOGLE_SERVICES_JSON_BASE64 as a repository secret."
-              )
-
-          data = json.loads(target.read_text(encoding="utf-8"))
-          packages = [
-              c.get("client_info", {})
-               .get("android_client_info", {})
-               .get("package_name")
-              for c in data.get("client", [])
-          ]
-          if "com.mohammedsamir.halaqati" not in packages:
-              raise SystemExit(f"ERROR: Firebase package mismatch: {packages}")
-
-          print("Firebase configuration verified.")
+          b64 = os.environ.get('FIREBASE_JSON_B64','')
+          raw = base64.b64decode(b64).decode() if b64 else os.environ.get('FIREBASE_JSON','')
+          if not raw: raise SystemExit('Missing HALAQATI_FIREBASE_GOOGLE_SERVICES_JSON_BASE64 or HALAQATI_FIREBASE_GOOGLE_SERVICES_JSON')
+          data = json.loads(raw)
+          packages = [c.get('client_info',{}).get('android_client_info',{}).get('package_name') for c in data.get('client',[])]
+          if 'com.mohammedsamir.halaqati' not in packages: raise SystemExit('Firebase package mismatch')
+          Path('app/google-services.json').write_text(raw)
+          if os.environ['VARIANT'] == 'release':
+              for name in ['KEYSTORE_B64','HALAQATI_STORE_PASSWORD','HALAQATI_KEY_ALIAS','HALAQATI_KEY_PASSWORD','EXPECTED_CERT']:
+                  if not os.environ.get(name): raise SystemExit('Missing release signing secret: '+name)
+              p = Path(os.environ['RUNNER_TEMP'])/'halaqati-release.jks'
+              p.write_bytes(base64.b64decode(os.environ['KEYSTORE_B64']))
+              with open(os.environ['GITHUB_ENV'],'a') as f: f.write('HALAQATI_KEYSTORE_PATH='+str(p)+'\n')
+          print('Firebase configuration validated; signing inputs checked.')
           PY
 
-      - name: Configure high-memory Kotlin compiler
-        shell: bash
+      - name: Static contracts and compiler regression checks
+        working-directory: ${{ env.PROJECT_DIR }}
         run: |
           set -euo pipefail
-          cd "$PROJECT_DIR"
+          for check in scripts/*check.py; do python3 "$check"; done
 
-          cat >> gradle.properties <<'EOF'
-
-          # GitHub public 16 GB runner CI profile
-          org.gradle.jvmargs=-Xmx2048m -Xms256m -XX:MaxMetaspaceSize=512m -XX:+UseG1GC -Dfile.encoding=UTF-8
-          kotlin.compiler.execution.strategy=daemon
-          kotlin.daemon.jvmargs=-Xmx9216m -Xms512m -XX:MaxMetaspaceSize=1024m -XX:ReservedCodeCacheSize=384m -XX:+UseG1GC -XX:+HeapDumpOnOutOfMemoryError
-          kotlin.daemon.useFallbackStrategy=false
-          kotlin.incremental=false
-          org.gradle.parallel=false
-          org.gradle.workers.max=1
-          org.gradle.caching=true
-          org.gradle.vfs.watch=false
-          EOF
-
-          mkdir -p "$HOME/.gradle"
-          cat > "$HOME/.gradle/gradle.properties" <<'EOF'
-          org.gradle.jvmargs=-Xmx2048m -Xms256m -XX:MaxMetaspaceSize=512m -XX:+UseG1GC -Dfile.encoding=UTF-8
-          kotlin.compiler.execution.strategy=daemon
-          kotlin.daemon.jvmargs=-Xmx9216m -Xms512m -XX:MaxMetaspaceSize=1024m -XX:ReservedCodeCacheSize=384m -XX:+UseG1GC -XX:+HeapDumpOnOutOfMemoryError
-          kotlin.daemon.useFallbackStrategy=false
-          kotlin.incremental=false
-          org.gradle.parallel=false
-          org.gradle.workers.max=1
-          org.gradle.caching=true
-          org.gradle.vfs.watch=false
-          EOF
-
-          echo "=== Runner memory ==="
+      - name: Compile Kotlin (bounded, with diagnostics)
+        timeout-minutes: 16
+        working-directory: ${{ env.PROJECT_DIR }}
+        env:
+          VARIANT: ${{ inputs.variant }}
+          HALAQATI_STORE_PASSWORD: ${{ secrets.HALAQATI_STORE_PASSWORD }}
+          HALAQATI_KEY_ALIAS: ${{ secrets.HALAQATI_KEY_ALIAS }}
+          HALAQATI_KEY_PASSWORD: ${{ secrets.HALAQATI_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          mkdir -p ci-logs
           free -h
-          echo "=== Effective CI memory profile ==="
-          grep -E '^(org.gradle.jvmargs|kotlin.compiler.execution.strategy|kotlin.daemon.jvmargs|org.gradle.workers.max)=' gradle.properties
+          # Explicit command-line properties override any stale user Gradle settings.
+          task=compileDebugKotlin
+          if [ "$VARIANT" = release ]; then task=compileReleaseKotlin; fi
+          python3 scripts/ci-build.py "$task" 840
 
-      - name: Generate Gradle wrapper
-        shell: bash
+      - name: Tests, lint and assemble chosen APK
+        timeout-minutes: 16
+        working-directory: ${{ env.PROJECT_DIR }}
+        env:
+          VARIANT: ${{ inputs.variant }}
+          HALAQATI_STORE_PASSWORD: ${{ secrets.HALAQATI_STORE_PASSWORD }}
+          HALAQATI_KEY_ALIAS: ${{ secrets.HALAQATI_KEY_ALIAS }}
+          HALAQATI_KEY_PASSWORD: ${{ secrets.HALAQATI_KEY_PASSWORD }}
         run: |
           set -euo pipefail
-          cd "$PROJECT_DIR"
-          gradle --no-daemon wrapper --gradle-version 8.13 --distribution-type bin
-          chmod +x gradlew
-          ./gradlew --version
+          if [ "$VARIANT" = release ]; then
+            python3 scripts/ci-build.py 'testReleaseUnitTest,lintRelease,assembleRelease' 840
+          else
+            python3 scripts/ci-build.py 'testDebugUnitTest,lintDebug,assembleDebug' 840
+          fi
 
-      - name: Static migration checks
-        shell: bash
+      - name: Verify APK and signing identity
+        working-directory: ${{ env.PROJECT_DIR }}
+        env:
+          VARIANT: ${{ inputs.variant }}
+          EXPECTED_CERT: ${{ secrets.HALAQATI_EXPECTED_SIGNING_CERT_SHA256 }}
         run: |
           set -euo pipefail
-          cd "$PROJECT_DIR"
+          mkdir -p verified
+          APK="app/build/outputs/apk/$VARIANT/app-$VARIANT.apk"
+          test -s "$APK"
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --print-certs "$APK" > ci-logs/apksigner.txt
+          "$ANDROID_HOME/build-tools/36.0.0/aapt" dump badging "$APK" > ci-logs/badging.txt
+          python3 - <<'PY'
+          import os, re
+          from pathlib import Path
+          text = Path('ci-logs/badging.txt').read_text()
+          assert "name='com.mohammedsamir.halaqati'" in text
+          assert "versionCode='24502'" in text
+          assert "sdkVersion:'23'" in text and "targetSdkVersion:'36'" in text
+          if os.environ['VARIANT'] == 'release':
+              cert = re.search(r'Signer #1 certificate SHA-256 digest: (\S+)',Path('ci-logs/apksigner.txt').read_text()).group(1)
+              normalize = lambda v: re.sub(r'[:\s]','',v).lower()
+              assert normalize(cert) == normalize(os.environ['EXPECTED_CERT']), 'Signing certificate mismatch'
+          PY
+          cp "$APK" "verified/Halaqati-v2.45.2-$VARIANT.apk"
+          cd verified
+          sha256sum *.apk > SHA256SUMS.txt
 
-          python3 scripts/compile-sanity-check.py
-          python3 scripts/compose-risk-check.py
-          python3 scripts/static-parity-check.py
-          python3 scripts/uiux-pro-max-check.py
-          python3 scripts/navigation-contract-check.py
-          python3 scripts/release-contract-check.py
-          python3 scripts/auth-push-privacy-check.py
-          python3 scripts/smart-plan-alerts-check.py
-          python3 scripts/offline-account-scope-check.py
-          python3 scripts/local-sensitive-account-scope-check.py
-          python3 scripts/manifest-contract-check.py
-
-      - name: Build debug APK
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$PROJECT_DIR"
-          ./gradlew --no-daemon --max-workers=1 --stacktrace :app:assembleDebug
-          find app/build/outputs -type f -name "*.apk" -print
-
-      - name: Upload APK
+      - name: Upload APK only after all gates pass
         uses: actions/upload-artifact@v4
         with:
-          name: Halaqati-debug-apk
-          path: ${{ env.PROJECT_DIR }}/app/build/outputs/**/*.apk
+          name: Halaqati-v2.45.2-${{ inputs.variant }}
+          path: ${{ env.PROJECT_DIR }}/verified/
           if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload diagnostic logs and test reports even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Halaqati-build-diagnostics-${{ github.run_id }}
+          path: |
+            ${{ env.PROJECT_DIR }}/ci-logs/
+            ${{ env.PROJECT_DIR }}/app/build/reports/
+          if-no-files-found: ignore
           retention-days: 7
+
+      - name: Remove restored secrets
+        if: always()
+        run: |
+          rm -f "$PROJECT_DIR/app/google-services.json" "$RUNNER_TEMP/halaqati-release.jks"
