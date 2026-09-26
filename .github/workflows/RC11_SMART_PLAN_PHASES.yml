@@ -1,0 +1,388 @@
+name: Halaqati v2.46.1 - RC11 Smart Plan Phases
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repository:
+        description: 'Repository containing the RC11 ZIP (owner/name); blank = this repository'
+        default: ''
+        type: string
+      source_ref:
+        description: 'Source branch, tag or commit'
+        default: 'main'
+        type: string
+      variant:
+        description: 'debug for testing; release for an update signed with your existing key'
+        default: debug
+        type: choice
+        options: [debug, release]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: halaqati-rc11-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  ARCHIVE_SHA256: b34a10f580dd778b0c6a4cde5bf990a8730d1b4dc98a0ba520229895fda430e8
+  PROJECT_DIR: ${{ github.workspace }}/extracted/Halaqati_Native_Kotlin_v2.46.1_RC11
+  GRADLE_VERSION: '8.13'
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 65
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout source repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.source_repository || github.repository }}
+          ref: ${{ inputs.source_ref }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN || secrets.HALAQATI_SOURCE_TOKEN || secrets.SOURCE_PAT || secrets.GH_PAT || github.token }}
+          path: source-repo
+          persist-credentials: false
+
+      - name: Verify exact RC11 archive and extract
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, os, zipfile
+          from pathlib import Path
+
+          expected_name = 'Halaqati_Native_Kotlin_v2_46_1_RC11_SMART_PLAN_PHASES.zip'
+          matches = [
+              p for p in Path('source-repo').rglob(expected_name)
+              if '.git' not in p.parts
+              and hashlib.sha256(p.read_bytes()).hexdigest() == os.environ['ARCHIVE_SHA256']
+          ]
+          if len(matches) != 1:
+              raise SystemExit(
+                  f'Upload exactly one {expected_name} with the expected SHA-256 '
+                  'to the selected source repository/ref.'
+              )
+
+          dest = Path('extracted').resolve()
+          dest.mkdir(exist_ok=False)
+          with zipfile.ZipFile(matches[0]) as z:
+              bad = z.testzip()
+              if bad:
+                  raise SystemExit(f'Corrupt source ZIP member: {bad}')
+              for info in z.infolist():
+                  target = (dest / info.filename).resolve()
+                  if not target.is_relative_to(dest):
+                      raise SystemExit(f'Unsafe archive member: {info.filename}')
+                  if (info.external_attr >> 16) & 0o170000 == 0o120000:
+                      raise SystemExit(f'Symlinks are not allowed: {info.filename}')
+              z.extractall(dest)
+
+          project = Path(os.environ['PROJECT_DIR'])
+          if not project.is_dir():
+              raise SystemExit(f'Expected project directory missing after extraction: {project}')
+          print('Verified RC11 source SHA-256:', os.environ['ARCHIVE_SHA256'])
+          print('Project:', project)
+          PY
+
+      - name: Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Gradle 8.13 with dependency cache
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: ${{ env.GRADLE_VERSION }}
+
+      - name: Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools'
+          log-accepted-android-sdk-licenses: false
+
+      - name: Ensure SDK 36 is available
+        timeout-minutes: 8
+        run: |
+          set -euo pipefail
+          sdkmanager --version
+          sdkmanager --install 'platforms;android-36' 'build-tools;36.0.0'
+
+      - name: Fetch verified Cairo font only when absent
+        timeout-minutes: 2
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -euo pipefail
+          python3 scripts/fetch-cairo-font.py
+
+      - name: Restore Firebase and optional release signing
+        timeout-minutes: 2
+        working-directory: ${{ env.PROJECT_DIR }}
+        env:
+          FIREBASE_JSON_B64: ${{ secrets.HALAQATI_FIREBASE_GOOGLE_SERVICES_JSON_BASE64 }}
+          FIREBASE_JSON: ${{ secrets.HALAQATI_FIREBASE_GOOGLE_SERVICES_JSON }}
+          KEYSTORE_B64: ${{ secrets.HALAQATI_KEYSTORE_BASE64 }}
+          HALAQATI_STORE_PASSWORD: ${{ secrets.HALAQATI_STORE_PASSWORD }}
+          HALAQATI_KEY_ALIAS: ${{ secrets.HALAQATI_KEY_ALIAS }}
+          HALAQATI_KEY_PASSWORD: ${{ secrets.HALAQATI_KEY_PASSWORD }}
+          EXPECTED_CERT: ${{ secrets.HALAQATI_EXPECTED_SIGNING_CERT_SHA256 }}
+          GOOGLE_WEB_CLIENT_ID_SECRET: ${{ secrets.HALAQATI_GOOGLE_WEB_CLIENT_ID }}
+          VARIANT: ${{ inputs.variant }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, json, os
+          from pathlib import Path
+
+          b64 = os.environ.get('FIREBASE_JSON_B64', '')
+          raw = base64.b64decode(b64).decode() if b64 else os.environ.get('FIREBASE_JSON', '')
+          if not raw:
+              raise SystemExit('Missing HALAQATI_FIREBASE_GOOGLE_SERVICES_JSON_BASE64 or HALAQATI_FIREBASE_GOOGLE_SERVICES_JSON')
+
+          data = json.loads(raw)
+          packages = [
+              c.get('client_info', {}).get('android_client_info', {}).get('package_name')
+              for c in data.get('client', [])
+          ]
+          if 'com.mohammedsamir.halaqati' not in packages:
+              raise SystemExit('Firebase package mismatch')
+          Path('app/google-services.json').write_text(raw)
+
+          web_client = ''
+          for client in data.get('client', []):
+              for oauth in client.get('oauth_client', []):
+                  if oauth.get('client_type') == 3 and oauth.get('client_id'):
+                      web_client = oauth['client_id']
+                      break
+              if web_client:
+                  break
+          web_client = web_client or os.environ.get('GOOGLE_WEB_CLIENT_ID_SECRET', '').strip()
+          if not web_client:
+              raise SystemExit(
+                  'Native Google sign-in requires a Web OAuth client id. '
+                  'Add it to Firebase google-services.json or set HALAQATI_GOOGLE_WEB_CLIENT_ID.'
+              )
+          with open(os.environ['GITHUB_ENV'], 'a') as f:
+              f.write('GOOGLE_WEB_CLIENT_ID=' + web_client + '\n')
+
+          if os.environ['VARIANT'] == 'release':
+              required = [
+                  'KEYSTORE_B64', 'HALAQATI_STORE_PASSWORD', 'HALAQATI_KEY_ALIAS',
+                  'HALAQATI_KEY_PASSWORD', 'EXPECTED_CERT'
+              ]
+              for name in required:
+                  if not os.environ.get(name):
+                      raise SystemExit('Missing release signing secret: ' + name)
+              keystore = Path(os.environ['RUNNER_TEMP']) / 'halaqati-release.jks'
+              keystore.write_bytes(base64.b64decode(os.environ['KEYSTORE_B64']))
+              with open(os.environ['GITHUB_ENV'], 'a') as f:
+                  f.write('HALAQATI_KEYSTORE_PATH=' + str(keystore) + '\n')
+
+          print('Firebase configuration validated; release signing inputs checked when required.')
+          PY
+
+      - name: RC11 targeted source checks first
+        timeout-minutes: 8
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -euo pipefail
+          mkdir -p ci-logs
+          {
+            echo '=== RC11 structural gate ==='
+            timeout 90s python3 scripts/rc11-smart-plan-phases-check.py
+            echo '=== RC11 targeted Kotlin self-test ==='
+            if command -v kotlinc >/dev/null 2>&1; then
+              timeout 180s bash scripts/run-rc11-targeted-selftest.sh
+            else
+              echo 'kotlinc CLI not present; the targeted Gradle/JUnit test below remains mandatory.'
+            fi
+          } 2>&1 | tee ci-logs/rc11-targeted-source.log
+
+      - name: RC11 targeted Gradle unit test (bounded)
+        timeout-minutes: 10
+        working-directory: ${{ env.PROJECT_DIR }}
+        env:
+          VARIANT: ${{ inputs.variant }}
+          HALAQATI_STORE_PASSWORD: ${{ secrets.HALAQATI_STORE_PASSWORD }}
+          HALAQATI_KEY_ALIAS: ${{ secrets.HALAQATI_KEY_ALIAS }}
+          HALAQATI_KEY_PASSWORD: ${{ secrets.HALAQATI_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          testTask=testDebugUnitTest
+          if [ "$VARIANT" = release ]; then testTask=testReleaseUnitTest; fi
+          python3 scripts/ci-build.py "$testTask" 540 --tests com.mohammedsamir.halaqati.plans.SmartPlanPhaseEngineTest
+
+      - name: Comprehensive static regression gates
+        timeout-minutes: 15
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -euo pipefail
+          mkdir -p ci-logs
+          checks=(
+            scripts/compile-sanity-check.py
+            scripts/compose-risk-check.py
+            scripts/static-parity-check.py
+            scripts/uiux-pro-max-check.py
+            scripts/manifest-contract-check.py
+            scripts/auth-push-privacy-check.py
+            scripts/offline-account-scope-check.py
+            scripts/local-sensitive-account-scope-check.py
+            scripts/smart-plan-alerts-check.py
+            scripts/navigation-contract-check.py
+            scripts/release-contract-check.py
+            scripts/release-parity-contract-check.py
+            scripts/full-release-parity-check.py
+            scripts/parity-matrix-check.py
+            scripts/behavioral-parity-check.py
+            scripts/compiler-regression-check.py
+            scripts/rc7-offline-contract-check.py
+            scripts/rc7-durability-check.py
+            scripts/rc8-integration-check.py
+            scripts/rc82-recitation-parity-check.py
+            scripts/rc83-smart-plan-quran-ux-check.py
+            scripts/rc84-direction-offline-ux-check.py
+            scripts/rc85-smart-plan-activity-performance-check.py
+            scripts/rc86-cache-sync-smartplan-ui-check.py
+            scripts/rc86-startup-crash-regression-check.py
+            scripts/rc86-v3-performance-session-ux-check.py
+            scripts/rc91-smart-plan-core-check.py
+            scripts/rc92-session-workflow-check.py
+            scripts/rc93-final-stabilization-check.py
+            scripts/rc93-refresh-scope-regression-check.py
+            scripts/rc93-fix3-runtime-ux-check.py
+            scripts/rc10-daily-intelligence-check.py
+            scripts/rc10-23-student-intelligence-check.py
+            scripts/rc10-23-guardian-queue-regression-check.py
+            scripts/rc10-23-dashboard-icon-regression-check.py
+          )
+          {
+            for check in "${checks[@]}"; do
+              echo "=== $check ==="
+              timeout 90s python3 "$check"
+            done
+            echo '=== Full bounded Kotlin self-test suite ==='
+            if command -v kotlinc >/dev/null 2>&1; then
+              timeout 420s bash scripts/run-kotlin-selftests.sh
+            else
+              echo 'kotlinc CLI not present; Gradle/JUnit tests remain mandatory below.'
+            fi
+          } 2>&1 | tee ci-logs/comprehensive-static.log
+
+      - name: Compile chosen Kotlin variant (bounded)
+        timeout-minutes: 10
+        working-directory: ${{ env.PROJECT_DIR }}
+        env:
+          VARIANT: ${{ inputs.variant }}
+          HALAQATI_STORE_PASSWORD: ${{ secrets.HALAQATI_STORE_PASSWORD }}
+          HALAQATI_KEY_ALIAS: ${{ secrets.HALAQATI_KEY_ALIAS }}
+          HALAQATI_KEY_PASSWORD: ${{ secrets.HALAQATI_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          task=compileDebugKotlin
+          if [ "$VARIANT" = release ]; then task=compileReleaseKotlin; fi
+          python3 scripts/ci-build.py "$task" 540
+
+      - name: Full Gradle unit tests (bounded)
+        timeout-minutes: 10
+        working-directory: ${{ env.PROJECT_DIR }}
+        env:
+          VARIANT: ${{ inputs.variant }}
+          HALAQATI_STORE_PASSWORD: ${{ secrets.HALAQATI_STORE_PASSWORD }}
+          HALAQATI_KEY_ALIAS: ${{ secrets.HALAQATI_KEY_ALIAS }}
+          HALAQATI_KEY_PASSWORD: ${{ secrets.HALAQATI_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          testTask=testDebugUnitTest
+          if [ "$VARIANT" = release ]; then testTask=testReleaseUnitTest; fi
+          python3 scripts/ci-build.py "$testTask" 540
+
+      - name: Lint chosen variant (bounded)
+        timeout-minutes: 10
+        working-directory: ${{ env.PROJECT_DIR }}
+        env:
+          VARIANT: ${{ inputs.variant }}
+          HALAQATI_STORE_PASSWORD: ${{ secrets.HALAQATI_STORE_PASSWORD }}
+          HALAQATI_KEY_ALIAS: ${{ secrets.HALAQATI_KEY_ALIAS }}
+          HALAQATI_KEY_PASSWORD: ${{ secrets.HALAQATI_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          lintTask=lintDebug
+          if [ "$VARIANT" = release ]; then lintTask=lintRelease; fi
+          python3 scripts/ci-build.py "$lintTask" 540
+
+      - name: Assemble chosen APK (bounded)
+        timeout-minutes: 10
+        working-directory: ${{ env.PROJECT_DIR }}
+        env:
+          VARIANT: ${{ inputs.variant }}
+          HALAQATI_STORE_PASSWORD: ${{ secrets.HALAQATI_STORE_PASSWORD }}
+          HALAQATI_KEY_ALIAS: ${{ secrets.HALAQATI_KEY_ALIAS }}
+          HALAQATI_KEY_PASSWORD: ${{ secrets.HALAQATI_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          assembleTask=assembleDebug
+          if [ "$VARIANT" = release ]; then assembleTask=assembleRelease; fi
+          python3 scripts/ci-build.py "$assembleTask" 540
+
+      - name: Verify APK identity and signing
+        timeout-minutes: 3
+        working-directory: ${{ env.PROJECT_DIR }}
+        env:
+          VARIANT: ${{ inputs.variant }}
+          EXPECTED_CERT: ${{ secrets.HALAQATI_EXPECTED_SIGNING_CERT_SHA256 }}
+        run: |
+          set -euo pipefail
+          mkdir -p verified ci-logs
+          APK="app/build/outputs/apk/$VARIANT/app-$VARIANT.apk"
+          test -s "$APK"
+
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --print-certs "$APK" > ci-logs/apksigner.txt
+          "$ANDROID_HOME/build-tools/36.0.0/aapt" dump badging "$APK" > ci-logs/badging.txt
+          "$ANDROID_HOME/build-tools/36.0.0/aapt" dump xmltree "$APK" AndroidManifest.xml > ci-logs/manifest.txt
+
+          python3 - <<'PY'
+          import os, re
+          from pathlib import Path
+
+          badging = Path('ci-logs/badging.txt').read_text()
+          assert "name='com.mohammedsamir.halaqati'" in badging
+          assert "versionCode='24611'" in badging
+          expected_name = '2.46.1-RC11' if os.environ['VARIANT'] == 'release' else '2.46.1-RC11-debug'
+          assert f"versionName='{expected_name}'" in badging, f'Unexpected versionName; expected {expected_name}'
+          assert "sdkVersion:'23'" in badging
+          assert "targetSdkVersion:'36'" in badging
+
+          if os.environ['VARIANT'] == 'release':
+              cert_text = Path('ci-logs/apksigner.txt').read_text()
+              match = re.search(r'Signer #1 certificate SHA-256 digest: (\S+)', cert_text)
+              assert match, 'Signing certificate digest missing from apksigner output'
+              normalize = lambda v: re.sub(r'[:\s]', '', v).lower()
+              assert normalize(match.group(1)) == normalize(os.environ['EXPECTED_CERT']), 'Signing certificate mismatch'
+          PY
+
+          OUT="verified/Halaqati-v2.46.1-RC11-SMART-PLAN-PHASES-$VARIANT.apk"
+          cp "$APK" "$OUT"
+          (cd verified && sha256sum *.apk > SHA256SUMS.txt)
+
+      - name: Upload APK only after all gates pass
+        uses: actions/upload-artifact@v4
+        with:
+          name: Halaqati-v2.46.1-RC11-SMART-PLAN-PHASES-${{ inputs.variant }}
+          path: ${{ env.PROJECT_DIR }}/verified/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload diagnostic logs and test reports even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Halaqati-RC11-build-diagnostics-${{ github.run_id }}
+          path: |
+            ${{ env.PROJECT_DIR }}/ci-logs/
+            ${{ env.PROJECT_DIR }}/app/build/reports/
+          if-no-files-found: ignore
+          retention-days: 14
